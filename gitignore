@@ -1,0 +1,14 @@
+# Binaire compilé
+contact-api
+
+# Environnement local
+.env
+.env.local
+
+# Fichiers Go
+*.test
+*.out
+
+# OS
+.DS_Store
+Thumbs.db
