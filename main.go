@@ -19,7 +19,7 @@ func main() {
 		w.Write([]byte("ok"))
 	})
 
-	log.Printf("contact-api démarré sur :%s", port)
+	log.Printf("contact-api démarré sur :%s (envoi : %s)", port, transport())
 	if err := http.ListenAndServe(":"+port, mux); err != nil {
 		log.Fatalf("Erreur serveur: %v", err)
 	}

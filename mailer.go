@@ -2,14 +2,45 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
+	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"mime"
+	"mime/multipart"
+	"mime/quotedprintable"
+	"net"
 	"net/http"
+	"net/mail"
+	"net/smtp"
+	"net/textproto"
 	"os"
 	"strings"
+	"time"
 )
 
 const mailjetAPI = "https://api.mailjet.com/v3.1/send"
+
+// headerSafe retire les retours à la ligne d'une valeur saisie par un visiteur : en SMTP,
+// elle finit dans les en-têtes du message, où un \r\n permettrait d'en injecter d'autres.
+var headerSafe = strings.NewReplacer("\r", " ", "\n", " ")
+
+// transport décrit le mode d'envoi choisi par les variables d'environnement : SMTP dès
+// que SMTP_HOST est renseigné, sinon l'API Mailjet (comportement historique).
+func transport() string {
+	if host := os.Getenv("SMTP_HOST"); host != "" {
+		return "SMTP " + host + ":" + smtpPort()
+	}
+	return "API Mailjet"
+}
+
+func smtpPort() string {
+	if p := os.Getenv("SMTP_PORT"); p != "" {
+		return p
+	}
+	return "587"
+}
 
 type mjRecipient struct {
 	Email string `json:"Email"`
@@ -137,10 +168,10 @@ Pascal`,
 	return sendMail(req.Email, req.Prenom, subject, text, html)
 }
 
-// sendMail appelle l'API Mailjet
+// sendMail envoie via SMTP si SMTP_HOST est renseigné (ex. Brevo), sinon via l'API
+// Mailjet. SMTP_USER/SMTP_PASS servent dans les deux cas : identifiants SMTP, ou clé et
+// secret de l'API Mailjet.
 func sendMail(toEmail, toName, subject, text, html string) error {
-	apiKey := os.Getenv("SMTP_USER")
-	apiSecret := os.Getenv("SMTP_PASS")
 	fromEmail := os.Getenv("FROM_EMAIL")
 	if fromEmail == "" {
 		fromEmail = os.Getenv("SMTP_FROM")
@@ -153,6 +184,122 @@ func sendMail(toEmail, toName, subject, text, html string) error {
 	if fromName == "" {
 		fromName = "Pascal"
 	}
+
+	if host := os.Getenv("SMTP_HOST"); host != "" {
+		return sendSMTP(host, fromEmail, fromName, toEmail, toName, subject, text, html)
+	}
+	return sendMailjet(fromEmail, fromName, toEmail, toName, subject, text, html)
+}
+
+func sendSMTP(host, fromEmail, fromName, toEmail, toName, subject, text, html string) error {
+	from, err := mail.ParseAddress(fromEmail)
+	if err != nil {
+		return fmt.Errorf("adresse d'expédition invalide: %w", err)
+	}
+	from.Name = headerSafe.Replace(fromName)
+	to, err := mail.ParseAddress(strings.TrimSpace(toEmail))
+	if err != nil {
+		return fmt.Errorf("adresse destinataire invalide: %w", err)
+	}
+	to.Name = headerSafe.Replace(toName)
+
+	msg, err := buildMessage(from, to, subject, text, html)
+	if err != nil {
+		return err
+	}
+
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, smtpPort()), 15*time.Second)
+	if err != nil {
+		return fmt.Errorf("connexion SMTP: %w", err)
+	}
+	conn.SetDeadline(time.Now().Add(30 * time.Second))
+	c, err := smtp.NewClient(conn, host)
+	if err != nil {
+		conn.Close()
+		return fmt.Errorf("client SMTP: %w", err)
+	}
+	defer c.Close()
+
+	if ok, _ := c.Extension("STARTTLS"); ok {
+		if err := c.StartTLS(&tls.Config{ServerName: host}); err != nil {
+			return fmt.Errorf("STARTTLS: %w", err)
+		}
+	}
+	// PlainAuth refuse d'envoyer les identifiants sur une connexion non chiffrée.
+	if user := os.Getenv("SMTP_USER"); user != "" {
+		if err := c.Auth(smtp.PlainAuth("", user, os.Getenv("SMTP_PASS"), host)); err != nil {
+			return fmt.Errorf("authentification SMTP: %w", err)
+		}
+	}
+	if err := c.Mail(from.Address); err != nil {
+		return fmt.Errorf("MAIL FROM: %w", err)
+	}
+	if err := c.Rcpt(to.Address); err != nil {
+		return fmt.Errorf("RCPT TO: %w", err)
+	}
+	w, err := c.Data()
+	if err != nil {
+		return fmt.Errorf("DATA: %w", err)
+	}
+	if _, err := w.Write(msg); err != nil {
+		return fmt.Errorf("écriture du message: %w", err)
+	}
+	if err := w.Close(); err != nil {
+		return fmt.Errorf("fin du message: %w", err)
+	}
+	return c.Quit()
+}
+
+// buildMessage produit un email multipart/alternative (texte + HTML), en-têtes encodés
+// en UTF-8 : le prénom et l'objet contiennent souvent des accents.
+func buildMessage(from, to *mail.Address, subject, text, html string) ([]byte, error) {
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	for _, part := range []struct{ ctype, content string }{
+		{"text/plain; charset=utf-8", text},
+		{"text/html; charset=utf-8", html},
+	} {
+		pw, err := mw.CreatePart(textproto.MIMEHeader{
+			"Content-Type":              {part.ctype},
+			"Content-Transfer-Encoding": {"quoted-printable"},
+		})
+		if err != nil {
+			return nil, err
+		}
+		qp := quotedprintable.NewWriter(pw)
+		if _, err := qp.Write([]byte(part.content)); err != nil {
+			return nil, err
+		}
+		if err := qp.Close(); err != nil {
+			return nil, err
+		}
+	}
+	if err := mw.Close(); err != nil {
+		return nil, err
+	}
+
+	id := make([]byte, 16)
+	if _, err := rand.Read(id); err != nil {
+		return nil, err
+	}
+	domain := from.Address[strings.LastIndex(from.Address, "@")+1:]
+
+	var msg bytes.Buffer
+	fmt.Fprintf(&msg, "From: %s\r\n", from.String())
+	fmt.Fprintf(&msg, "To: %s\r\n", to.String())
+	fmt.Fprintf(&msg, "Subject: %s\r\n", mime.QEncoding.Encode("utf-8", headerSafe.Replace(subject)))
+	fmt.Fprintf(&msg, "Date: %s\r\n", time.Now().Format(time.RFC1123Z))
+	fmt.Fprintf(&msg, "Message-ID: <%s@%s>\r\n", hex.EncodeToString(id), domain)
+	msg.WriteString("MIME-Version: 1.0\r\n")
+	fmt.Fprintf(&msg, "Content-Type: multipart/alternative; boundary=%q\r\n\r\n", mw.Boundary())
+	msg.Write(body.Bytes())
+	return msg.Bytes(), nil
+}
+
+// sendMailjet appelle l'API Mailjet (SMTP_USER = clé API, SMTP_PASS = clé secrète).
+func sendMailjet(fromEmail, fromName, toEmail, toName, subject, text, html string) error {
+	apiKey := os.Getenv("SMTP_USER")
+	apiSecret := os.Getenv("SMTP_PASS")
 
 	payload := mjPayload{
 		Messages: []mjContent{

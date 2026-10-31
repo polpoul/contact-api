@@ -78,7 +78,7 @@ func jsonError(w http.ResponseWriter, msg string, code int) {
 
 func isValidEmail(email string) bool {
 	email = strings.TrimSpace(email)
-	if email == "" {
+	if email == "" || strings.ContainsAny(email, "\r\n") {
 		return false
 	}
 	at := strings.LastIndex(email, "@")
